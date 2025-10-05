@@ -395,6 +395,7 @@ def _build_claim_report_text(selected_id, row_sel, C):
         "-" * 54,
         f"Provider:         {_get(row_sel, C['provider'])}",
         f"Service/Condition:{_get(row_sel, C['benefit'])}",
+        f"Ailments:         {_get(row_sel, C['ailments'])}",
         f"Claim Amount:     {_fmt_kes(_get(row_sel, C['amount']))}",
         f"Risk Level:       {_get(row_sel, C['risk'])}",
         f"Fraud Score:      {float(_get(row_sel, C['fraud_score'], 0)):.2f}",
@@ -465,12 +466,52 @@ def copy_button(text: str, label: str = "Copy Details"):
     )
 
 def email_button(subject: str, body: str, label: str = "Email Report"):
-    # Render OUTSIDE an iframe so mailto opens your default client
-    href = f"mailto:claims@minet.com?subject={quote(subject)}&body={quote(body)}"
-    st.markdown(
-        f'<a class="mfds-btn-link" href="{href}" target="_blank" rel="noopener noreferrer">{label}</a>',
-        unsafe_allow_html=True,
-    )
+    btn_id = f"qa_email_{uuid4().hex}"
+    subject_js = json.dumps(subject)
+    body_js = json.dumps(body)
+    
+    components.html(f"""
+    <div style="width:100%">
+        <style>
+        .mfds-btn {{
+            display: block; 
+            width: 100%; 
+            height: 48px;
+            border: none; 
+            border-radius: 12px;
+            background: #c4171b; 
+            color: #fff; 
+            font-weight: 700;
+            box-shadow: 0 8px 20px rgba(0,0,0,.10);
+            cursor: pointer;
+            transition: transform .12s ease, background .12s ease, box-shadow .12s ease;
+            font-family: inherit;
+            font-size: 14px;
+            text-decoration: none !important;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .mfds-btn:hover {{
+            transform: translateY(-1px); 
+            background: #9f1417;
+            box-shadow: 0 10px 24px rgba(0,0,0,.15);
+        }}
+        </style>
+        <button id="{btn_id}" class="mfds-btn">{label}</button>
+        <script>
+        (function(){{
+            const subject = {subject_js};
+            const body = {body_js};
+            const btn = document.getElementById("{btn_id}");
+            btn.addEventListener('click', () => {{
+                const mailtoLink = `mailto:claims@minet.com?subject=${{encodeURIComponent(subject)}}&body=${{encodeURIComponent(body)}}`;
+                window.open(mailtoLink, '_blank');
+            }});
+        }})();
+        </script>
+    </div>
+    """, height=54)
 
 def print_button(report_text: str, title: str, label: str = "Print View"):
     btn_id = f"qa_print_{uuid4().hex}"
@@ -570,7 +611,7 @@ def display_results(final_results: pd.DataFrame, scored: pd.DataFrame, processin
     final_results["fraud_prediction"] = final_results.get("needs_review", 0).astype(int)
 
     display_columns = [c for c in [
-        'VISIT_ID', 'GENDER(CLAIMANT)', 'AGE(CLAIMANT)', 'PROVIDER',
+        'VISIT_ID', 'GENDER(CLAIMANT)', 'AGE(CLAIMANT)', 'PROVIDER','AILMENTS',
         'TOTAL_PAYABLE', 'fraud_prediction', 'risk_level', 'fraud_score'
     ] if c in final_results.columns]
 
@@ -597,6 +638,7 @@ def display_results(final_results: pd.DataFrame, scored: pd.DataFrame, processin
     C['company']    = _find_col(final_results, ['COMPANY', 'company', 'employer'])
     C['relationship']= _find_col(final_results, ['RELATIONSHIP', 'relationship'])
     C['benefit']    = _find_col(final_results, ['BROAD_BENEFIT', 'benefit', 'AILMENTS', 'ailments'])
+    C['ailments']   = _find_col(final_results, ['AILMENTS', 'ailments', 'DIAGNOSIS', 'diagnosis'])
     C['date']       = _find_col(final_results, ['AILMENT_DATE', 'SERVICE_DATE', 'VISIT_DATE', 'DATE'])
     C['amount']     = _find_col(final_results, ['TOTAL_PAYABLE', 'total_payable'])
     C['cover']      = _find_col(final_results, ['COVER_LIMIT', 'cover_limit'])
@@ -634,51 +676,114 @@ def display_results(final_results: pd.DataFrame, scored: pd.DataFrame, processin
             return np.nan
 
     def compose_reason(row_, dataset=final_results):
-        parts, actions, ctx = [], [], []
-        prov = row_.get(C['provider'], 'This provider') if C['provider'] else 'This provider'
-        benefit = row_.get(C['benefit'], 'this service') if C['benefit'] else 'this service'
-        amt = None
-        if C['amount']:
-            try: amt = float(row_.get(C['amount'], np.nan))
-            except: amt = np.nan
-        typ = _typical_cost(row_)
-        if amt is not None and not np.isnan(amt) and typ and not np.isnan(typ) and typ > 0:
-            diff = _pct_diff(amt, typ)
-            if pd.notna(diff) and abs(diff) >= 0.5:
-                above_below = "higher" if diff > 0 else "lower"
-                parts.append(f"{prov} charged {_fmt_kes(amt)} for {benefit}, which is {abs(diff):.0%} {above_below} than the typical {_fmt_kes(typ)}.")
-                actions.append("Check invoice details, unit prices, and match to treatment provided.")
-        if C['cover'] and C['amount']:
-            try:
-                cover = float(row_.get(C['cover'], np.nan))
-                if cover and not np.isnan(cover) and amt and not np.isnan(amt):
-                    ratio = amt / cover
-                    if ratio >= 0.8:
-                        parts.append(f"The claim is {_fmt_kes(amt)}, {ratio:.0%} of the coverage limit ({_fmt_kes(cover)}).")
-                        actions.append("Confirm supporting documents and medical necessity.")
-            except Exception:
-                pass
-        if C['days_gap'] and typ_gap is not None:
-            try:
-                gap = float(row_.get(C['days_gap'], np.nan))
-                if pd.notna(gap) and gap <= max(3, 0.5 * typ_gap):
-                    parts.append(f"Very short gap between visits: {int(gap)} days vs typical {int(typ_gap)} days.")
-                    actions.append("Check for duplicates or unnecessary repeat visits.")
-            except Exception:
-                pass
-        if C['freq']:
-            try:
-                freq = int(float(row_.get(C['freq'], 0)))
-                if freq >= 5:
-                    parts.append(f"Unusually many visits: {freq} in a short period.")
-                    actions.append("Verify if services could have been combined.")
-            except Exception:
-                pass
-        if not parts:
-            existing = str(row_.get(C['reason_existing'], "")).strip() if C['reason_existing'] else ""
-            parts.append(existing or "This claim shows unusual patterns compared with similar cases.")
-            actions.append("Review provider invoice, visit history, and member details.")
-        return " ".join(parts), "Action: " + " ".join(actions)
+        """Generate specific, detailed reasons like the reference script"""
+        reasons = []
+        
+        # Define thresholds (you can adjust these based on your reference script)
+        thr = {
+            "provider_z_high": 3.0,
+            "provider_z_very_high": 5.0,
+            "recent_visit": 7.0,  # days
+            "recent_same_provider": 7.0,  # days  
+            "recent_ailment": 7.0,  # days
+            "mismatch_many": 3.0,
+            "combined_high": 0.7  # anomaly score threshold
+        }
+        
+        def add_reason(txt):
+            if txt and txt not in reasons:
+                reasons.append(txt)
+
+        # 1. Claim pattern anomaly
+        if "claim_pattern_anomaly_score" in row_:
+            score = pd.to_numeric(row_["claim_pattern_anomaly_score"], errors="coerce")
+            if pd.notna(score) and score >= 1.0:  # High anomaly score
+                add_reason("Unusual claim pattern compared to peers")
+
+        # 2. Provider outlier detection
+        if "provider_claim_zscore" in row_:
+            z = pd.to_numeric(row_["provider_claim_zscore"], errors="coerce")
+            if pd.notna(z):
+                if z >= thr["provider_z_very_high"]:
+                    add_reason("Provider appears as a strong outlier (very high claim amount)")
+                elif z >= thr["provider_z_high"]:
+                    add_reason("Provider appears as an outlier (high claim amount)")
+
+        # 3. Visit frequency patterns
+        if "days_since_last_visit" in row_:
+            days = pd.to_numeric(row_["days_since_last_visit"], errors="coerce")
+            if pd.notna(days) and days <= thr["recent_visit"]:
+                if days == 0:
+                    add_reason("Visited again very soon after a previous visit")
+                else:
+                    add_reason("Very frequent visits in a short period")
+
+        # 4. Same provider repeat visits
+        if "days_since_last_provider_visit" in row_:
+            days = pd.to_numeric(row_["days_since_last_provider_visit"], errors="coerce")
+            if pd.notna(days) and days <= thr["recent_same_provider"]:
+                add_reason("Repeat visit to the same provider within a short time")
+
+        # 5. New ailments soon after previous
+        if "days_since_last_ailment" in row_:
+            days = pd.to_numeric(row_["days_since_last_ailment"], errors="coerce")
+            if pd.notna(days) and days <= thr["recent_ailment"]:
+                add_reason("New ailment recorded unusually soon after a previous one")
+
+        # 6. Data mismatches
+        if "mismatch_score" in row_:
+            m = pd.to_numeric(row_["mismatch_score"], errors="coerce")
+            if pd.notna(m):
+                if m >= thr["mismatch_many"]:
+                    add_reason("Multiple data mismatches in claim details")
+                elif m > 0:
+                    add_reason("Some data mismatches in claim details")
+
+        # 7. Provider risk indicators
+        if "hospital_risk_score" in row_:
+            h = pd.to_numeric(row_["hospital_risk_score"], errors="coerce")
+            if pd.notna(h) and h >= 1.0:
+                add_reason("Provider flagged with prior risk indicators")
+
+        # 8. Location risk
+        if "is_high_risk_location" in row_ and (row_["is_high_risk_location"] in [1, True, "1", "True", "true"]):
+            add_reason("Location is known to be high risk")
+
+        # 9. Company fraud history
+        if "company_fraud_incident_flag" in row_ and (row_["company_fraud_incident_flag"] in [1, True, "1", "True", "true"]):
+            add_reason("Company has prior fraud incidents")
+
+        # 10. AI model flags
+        if "autoencoder_anomaly_score" in row_:
+            ae = pd.to_numeric(row_["autoencoder_anomaly_score"], errors="coerce")
+            if pd.notna(ae) and ae >= thr["combined_high"]:
+                add_reason("AI model flagged this claim as unusual")
+
+        # 11. Overall anomaly score
+        if "combined_anomaly_score" in row_:
+            ca = pd.to_numeric(row_["combined_anomaly_score"], errors="coerce")
+            if pd.notna(ca) and ca >= thr["combined_high"]:
+                add_reason("Overall anomaly score is high")
+
+        # 12. Fallback if no specific reasons found but claim is flagged
+        if not reasons and row_.get('needs_review') == 1:
+            add_reason("Ranked high by overall risk score")
+
+        # Create actionable summary based on reasons
+        actions = []
+        if any("outlier" in reason.lower() for reason in reasons):
+            actions.append("Review provider pricing and service justification")
+        if any("frequent" in reason.lower() or "visit" in reason.lower() for reason in reasons):
+            actions.append("Verify medical necessity for frequent visits")
+        if any("mismatch" in reason.lower() for reason in reasons):
+            actions.append("Cross-check claimant and service details")
+        if any("risk" in reason.lower() for reason in reasons):
+            actions.append("Enhanced verification required")
+        
+        if not actions:
+            actions.append("Review provider documentation and patient eligibility")
+
+        return "; ".join(reasons), "Recommended: " + "; ".join(actions)
 
     if st.session_state.filters_applied and st.session_state.filtered_view is not None:
         view = st.session_state.filtered_view
@@ -769,7 +874,7 @@ def display_results(final_results: pd.DataFrame, scored: pd.DataFrame, processin
     view_subset['Action'] = actions
 
     show_cols = []
-    for key in [C['visit_id'], C['provider'], C['benefit'], C['amount'], C['risk'], C['fraud_score']]:
+    for key in [C['visit_id'], C['provider'], C['benefit'], C['ailments'], C['amount'], C['risk'], C['fraud_score']]:
         if key: show_cols.append(key)
     show_cols += ['Reason']
 
@@ -777,6 +882,7 @@ def display_results(final_results: pd.DataFrame, scored: pd.DataFrame, processin
         (C['visit_id'] or ''): 'Visit ID',
         (C['provider'] or ''): 'Provider',
         (C['benefit'] or ''): 'Service/Condition',
+        (C['ailments'] or ''): 'Ailments/Diagnosis',
         (C['amount'] or ''): 'Claim Amount',
         (C['risk'] or ''): 'Risk Level',
         (C['fraud_score'] or ''): 'Fraud Score',
@@ -1237,7 +1343,25 @@ Your data should include these columns (case-sensitive):
                 else:
                     with st.spinner("Scoring with the frozen model..."):
                         start = time.time()
-                        scored = scorer.score(df_raw.copy())
+                        # Defensive normalization of incoming DF before sending to scorer
+                        orig_cols = list(df_raw.columns)
+                        df_raw = df_raw.copy()
+                        df_raw.columns = [str(c).strip().lower().replace(' ', '_').replace('-', '_').replace('__', '_') for c in df_raw.columns]
+
+                        # Optional debug mapping so you can verify canonicalization in the UI
+                        # st.write("DEBUG: Original -> Canonical column mapping")
+                        # for o, n in zip(orig_cols, df_raw.columns):
+                        #     st.write(f"  '{o}' -> '{n}'")
+
+                        # Now call the scorer using normalized df_raw
+                        scored = scorer.score(df_raw)
+
+                        
+                        # DEBUG: Check what columns the scorer returns
+                        # st.write(f"Scored data columns: {list(scored.columns)}")
+                        st.write(f"Scored data shape: {scored.shape}")
+                        st.write("First few rows of scored data:")
+                        st.dataframe(scored.head(3))
                         df_aux = preprocess_data(df_raw.copy())
                         keep_aux = [c for c in df_aux.columns if c not in scored.columns]
                         final_results = pd.concat(
@@ -1250,6 +1374,36 @@ Your data should include these columns (case-sensitive):
                         st.session_state.final_results = final_results
                         st.session_state.processing_time = time.time() - start
                         st.success(f"Processed {len(final_results)} rows.")
+                        # Show debug output from score_runtime
+                        # if 'debug_messages' in st.session_state and st.session_state.debug_messages:
+                        #     with st.expander("🔍 Score Runtime Debug Output (Click to see what's happening)"):
+                        #         for msg in st.session_state.debug_messages:
+                        #             st.text(msg)
+
+                        # # Also add this to check what columns we actually have in SCORED data
+                        # st.write("### 🔍 Debug: Checking Engineered Features in SCORED Data")
+                        # engineered_features_to_check = [
+                        #     'claim_ratio', 'service_charge_pct_dev_by_ailment', 'repeat_claimant_count',
+                        #     'age_rel_mismatch_flag', 'provider_claim_zscore', 'is_maternity_benefit'
+                        # ]
+
+                        # for feat in engineered_features_to_check:
+                        #     if feat in scored.columns:  # Check SCORED data, not final_results
+                        #         st.success(f"✅ Found {feat} in scored data")
+                        #         st.write(f"Sample values: {scored[feat].head(3).tolist()}")
+                        #     else:
+                        #         st.error(f"❌ MISSING {feat} in scored data")
+
+                        # # Check if explanations are working in SCORED data
+                        # st.write("### 🔍 Debug: Checking Explanations in SCORED Data")
+                        # if 'explanation' in scored.columns:
+                        #     st.success("✅ Explanations column found in scored data")
+                        #     st.write("Sample explanations:", scored['explanation'].head(3).tolist())
+                        # else:
+                        #     st.error("❌ No explanations column found in scored data")
+
+                        # Clear debug messages for next run
+                        st.session_state.debug_messages = []
             except Exception as e:
                 st.error(f"Error reading file: {e}")
                 st.code(traceback.format_exc())
